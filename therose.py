@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os, re, sys, time, json, requests
+from urllib.parse import urljoin
 from seleniumbase import SB
 
 # 环境变量
@@ -297,462 +298,377 @@ for (let btn of allBtns) {
 return null;
 """
 
-# ====== JS 转储页面所有可交互元素（用于调试）======
-_JS_DUMP_ELEMENTS = """
-(function() {
-    var results = [];
-    var els = document.querySelectorAll('button, a, input[type="submit"], input[type="button"], [role="button"], .btn, [onclick], [data-action]');
-    for (var i = 0; i < els.length; i++) {
-        var el = els[i];
-        var rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) continue;
-        results.push({
-            tag: el.tagName.toLowerCase(),
-            type: el.getAttribute('type') || '',
-            text: (el.innerText || el.textContent || '').trim().substring(0, 60),
-            title: (el.getAttribute('title') || '').substring(0, 40),
-            'aria-label': (el.getAttribute('aria-label') || '').substring(0, 40),
-            'data-action': el.getAttribute('data-action') || '',
-            name: el.getAttribute('name') || '',
-            value: el.getAttribute('value') || '',
-            'class': (el.className || '').substring(0, 40),
-            href: (el.getAttribute('href') || '').substring(0, 60),
-            visible: el.offsetParent !== null,
-            disabled: el.disabled,
-            rect: rect.width.toFixed(0) + 'x' + rect.height.toFixed(0)
-        });
-    }
-    return JSON.stringify(results, null, 2);
-})();
-"""
-
-# ====== JS 获取页面关键调试信息 ======
-_JS_PAGE_INFO = """
-(function() {
-    var info = {
-        title: document.title,
-        url: location.href,
-        bodyTextPreview: (document.body ? document.body.innerText || '' : '').trim().substring(0, 2000),
-        loginForm: null,
-        passwordInputs: document.querySelectorAll('input[type="password"]').length,
-        textInputs: document.querySelectorAll('input[type="text"], input[type="email"], input[name="user"], input[name="email"]').length,
-        buttons: document.querySelectorAll('button').length,
-        links: document.querySelectorAll('a').length,
-    };
-    var pw = document.querySelector('input[type="password"]');
-    if (pw) {
-        var form = pw.closest('form');
-        info.loginForm = form ? (form.id || form.className || 'unknown_form') : 'no_form';
-        var labels = document.querySelectorAll('label');
-        info.labels = [];
-        for (var i = 0; i < labels.length; i++) {
-            info.labels.push((labels[i].innerText || '').trim().substring(0, 30));
-        }
-    }
-    return JSON.stringify(info, null, 2);
-})();
-"""
-
-# 执行启动或重启服务器操作
-def start_or_reboot_server(sb, url):
-    print(f"🔄 准备进入服务器面板进行启动/重启: {url}")
-
+# ====== 提取页面可交互元素（Python 解析 HTML，不依赖 JS）======
+def _dump_page_source(sb, tag):
+    """通过 get_page_source 获取 HTML，提取关键信息用于调试"""
     try:
-        sb.save_screenshot("before_server_action.png")
-    except Exception:
-        pass
+        html = sb.get_page_source()
+        if not html:
+            print(f"⚠️ [{tag}] get_page_source 返回空")
+            return
+        
+        from html.parser import HTMLParser
+        
+        class ButtonFinder(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.buttons = []
+                self.in_tag = False
+                self.current = {}
+                self.skip = False
+            
+            def handle_starttag(self, tag, attrs):
+                attrs_dict = dict(attrs)
+                tag = tag.lower()
+                
+                if tag in ('button', 'a', 'input', 'span'):
+                    rtype = attrs_dict.get('type', '')
+                    rrole = attrs_dict.get('role', '')
+                    if tag == 'button' or rtype in ('submit', 'button') or rrole == 'button' or tag == 'a':
+                        self.current = {
+                            'tag': tag,
+                            'type': rtype,
+                            'text': '',
+                            'title': attrs_dict.get('title', ''),
+                            'aria-label': attrs_dict.get('aria-label', ''),
+                            'data-action': attrs_dict.get('data-action', ''),
+                            'name': attrs_dict.get('name', ''),
+                            'value': attrs_dict.get('value', ''),
+                            'class': attrs_dict.get('class', ''),
+                            'href': attrs_dict.get('href', ''),
+                            'id': attrs_dict.get('id', ''),
+                        }
+                        self.in_tag = True
+                        self.skip = False
+                elif tag in ('script', 'style'):
+                    self.skip = True
+            
+            def handle_data(self, data):
+                if self.in_tag and not self.skip:
+                    self.current['text'] += data.strip()
+            
+            def handle_endtag(self, tag):
+                if self.in_tag and tag.lower() in ('button', 'a', 'input', 'span'):
+                    text = self.current['text'][:60]
+                    if text or self.current['title'] or self.current['aria-label'] or self.current['data-action']:
+                        self.buttons.append(self.current)
+                    self.in_tag = False
+                self.skip = False
+        
+        finder = ButtonFinder()
+        finder.feed(html)
+        
+        print(f"📋 [{tag}] 页面可交互元素 ({len(finder.buttons)}个):")
+        for idx, el in enumerate(finder.buttons):
+            parts = []
+            if el['text']: parts.append(f"text='{el['text']}'")
+            if el['title']: parts.append(f"title='{el['title']}'")
+            if el['aria-label']: parts.append(f"aria='{el['aria-label']}'")
+            if el['data-action']: parts.append(f"action='{el['data-action']}'")
+            if el['name']: parts.append(f"name='{el['name']}'")
+            if el['value']: parts.append(f"value='{el['value']}'")
+            if el['class']: parts.append(f"class='{el['class']}'")
+            if el['href']: parts.append(f"href='{el['href']}'")
+            if el['id']: parts.append(f"id='{el['id']}'")
+            print(f"   [{idx}] <{el['tag']}> {' '.join(parts)}")
+        
+        # 也打印页面标题
+        title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
+        title = title_match.group(1) if title_match else "(无标题)"
+        print(f"📋 [{tag}] 页面标题: {title}")
+        
+        # 检查 iframe
+        iframe_count = html.lower().count('<iframe')
+        if iframe_count > 0:
+            print(f"📋 [{tag}] 页面包含 {iframe_count} 个 iframe")
+        
+        # 检查页面是否包含关键文字
+        text_lower = html.lower()
+        for keyword in ['start', '启动', 'restart', '重启', 'reboot', 'power', '开机', 'login', 'sign in', '登录']:
+            if keyword in text_lower:
+                print(f"📋 [{tag}] 页面包含关键词: '{keyword}'")
+        
+    except Exception as e:
+        print(f"⚠️ [{tag}] 解析页面失败: {e}")
 
-    def _dump_page(sb, tag):
-        """打印当前页面关键信息，用于调试"""
-        try:
-            page_info = sb.driver.execute_script(_JS_PAGE_INFO)
-            info = json.loads(page_info)
-            print(f"📋 [{tag}] 页面标题: {info['title']}")
-            print(f"📋 [{tag}] 当前URL: {info['url']}")
-            print(f"📋 [{tag}] 密码框: {info['passwordInputs']}个, 输入框: {info['textInputs']}个, 按钮: {info['buttons']}个, 链接: {info['links']}个")
-            if info.get('loginForm'):
-                print(f"📋 [{tag}] 检测到登录表单: {info['loginForm']}")
-                if info.get('labels'):
-                    print(f"📋 [{tag}] 表单标签: {info['labels']}")
-            if info.get('bodyTextPreview'):
-                preview = info['bodyTextPreview'][:500]
-                print(f"📋 [{tag}] 页面文字预览(前500字符):\n{preview}")
-        except Exception as e:
-            print(f"⚠️ [{tag}] 获取页面信息失败: {e}")
+# ====== 启动/重启服务器 ======
+def start_or_reboot_server(sb, server_url):
+    """
+    启动或重启服务器。
+    策略：先尝试直达 server_url，如果 404 则从面板首页找服务器列表导航进去。
+    """
+    print(f"🔄 准备进入服务器面板进行启动/重启")
 
-    def _dump_clickable(sb, tag):
-        """转储页面上所有可点击元素，用于调试"""
+    def _is_404(sb):
+        """检查当前页面是否显示 404 / 资源不存在"""
         try:
-            dump = sb.driver.execute_script(_JS_DUMP_ELEMENTS)
-            elements = json.loads(dump)
-            print(f"📋 [{tag}] 页面上可见的可交互元素列表 ({len(elements)}个):")
-            for idx, el in enumerate(elements):
-                print(f"   [{idx}] <{el['tag']}> text='{el['text']}' title='{el['title']}' "
-                      f"aria='{el['aria-label']}' action='{el['data-action']}' "
-                      f"name='{el['name']}' value='{el['value']}' "
-                      f"class='{el['class']}' href='{el['href']}' "
-                      f"visible={el['visible']} disabled={el['disabled']} size={el['rect']}")
-        except Exception as e:
-            print(f"⚠️ [{tag}] 转储可点击元素失败: {e}")
+            html = (sb.get_page_source() or '').lower()
+            if 'something went wrong' in html and 'does not exist' in html:
+                return True
+            title = (sb.get_title() or '').lower()
+            if '404' in title or 'not found' in title:
+                return True
+        except:
+            pass
+        return False
 
     def _is_login_page(sb):
         """判断当前页面是否是登录页"""
         try:
-            # 1. URL 包含 login / signin
             url = sb.get_current_url().lower()
-            if 'login' in url or 'signin' in url or 'auth' in url or 'log-in' in url:
+            if 'login' in url or 'signin' in url or 'auth' in url:
                 return True
-            # 2. 页面有密码框
-            pw_count = len(sb.driver.execute_script("return document.querySelectorAll('input[type=\"password\"]').length"))
-            if pw_count > 0:
+            pw_inputs = sb.find_elements('input[type="password"]', timeout=2)
+            if pw_inputs and len(pw_inputs) > 0:
                 return True
-            # 3. 页面文字包含 "Sign in" / "Login" 且有表单
-            text = (sb.driver.execute_script("return document.body ? document.body.innerText : ''") or '').lower()
-            if ('sign in' in text or 'login' in text or 'log in' in text) and pw_count > 0:
+            html = (sb.get_page_source() or '').lower()
+            if ('sign in' in html or 'login' in html) and 'password' in html:
                 return True
         except:
             pass
         return False
 
     def _try_login_panel(sb):
-        """在控制面板的登录页尝试登录"""
-        print("🔒 检测到控制面板登录页，正在尝试自动登录...")
-        _dump_page(sb, "登录页")
+        """在面板登录页尝试登录"""
+        print("🔒 检测到登录页，尝试自动登录...")
+        _dump_page_source(sb, "登录页")
         try:
-            # 找所有输入框
-            pw_inputs = sb.driver.execute_script("return document.querySelectorAll('input[type=\"password\"]').length")
-            if pw_inputs == 0:
-                print("⚠️ 未找到密码输入框，跳过自动登录")
+            pw_inputs = sb.find_elements('input[type="password"]', timeout=3)
+            if not pw_inputs or len(pw_inputs) == 0:
+                print("⚠️ 未找到密码框")
                 return False
 
-            # 找邮箱/用户名输入框
-            email_selectors = [
+            # 填邮箱
+            email_filled = False
+            email_sels = [
                 'input[type="text"]', 'input[type="email"]', 'input[name="user"]',
                 'input[name="email"]', 'input[name="username"]', 'input[name="login"]'
             ]
-            email_filled = False
-            for sel in email_selectors:
+            for sel in email_sels:
                 try:
-                    inputs = sb.driver.find_elements("css selector", sel)
+                    inputs = sb.find_elements(sel, timeout=2)
                     for inp in inputs:
-                        if inp.is_displayed():
-                            inp.clear()
-                            inp.send_keys(EMAIL)
-                            email_filled = True
-                            print(f"✅ 已填写邮箱到: {sel}")
-                            break
+                        try:
+                            if inp.is_displayed():
+                                inp.clear()
+                                inp.send_keys(EMAIL)
+                                email_filled = True
+                                break
+                        except:
+                            continue
                     if email_filled:
                         break
                 except:
                     continue
-
             if not email_filled:
-                print("⚠️ 未找到邮箱输入框，尝试使用第一个可见文本输入框")
+                # 试试第一个可见输入框
                 try:
-                    all_inputs = sb.driver.execute_script("""
-                        return Array.from(document.querySelectorAll('input')).filter(function(el) {
-                            return el.type !== 'hidden' && el.type !== 'password' && el.offsetParent !== null;
-                        });
-                    """)
-                    if all_inputs and len(all_inputs) > 0:
-                        all_inputs[0].clear()
-                        all_inputs[0].send_keys(EMAIL)
-                        print("✅ 已填写邮箱到第一个可见输入框")
+                    all_ins = sb.find_elements('input:not([type="hidden"]):not([type="password"])', timeout=3)
+                    for inp in all_ins:
+                        if inp.is_displayed():
+                            inp.clear()
+                            inp.send_keys(EMAIL)
+                            email_filled = True
+                            break
                 except:
                     pass
 
-            # 填写密码
+            # 填密码
             try:
-                pw_input = sb.driver.find_element("css selector", 'input[type="password"]')
-                pw_input.clear()
-                pw_input.send_keys(PASSWORD)
-                print("✅ 已填写密码")
+                pw = sb.find_element('input[type="password"]', timeout=3)
+                pw.clear()
+                pw.send_keys(PASSWORD)
             except Exception as e:
-                print(f"⚠️ 填写密码失败: {e}")
+                print(f"⚠️ 填密码失败: {e}")
 
             time.sleep(1)
-
-            # 尝试 Turnstile
             try:
                 sb.uc_gui_click_captcha()
-                print("✅ Turnstile 验证已处理")
-            except Exception as e:
-                print(f"⚠️ Turnstile 处理: {e}")
-
+            except:
+                pass
             time.sleep(3)
 
-            # 点击登录按钮 - 各种尝试
-            login_clicked = False
-            login_btn_selectors = [
-                'button:contains("Sign in")',
-                'button:contains("Login")',
-                'button:contains("Log in")',
-                'button:contains("Sign In")',
-                'button:contains("登录")',
-                'button[type="submit"]',
-                'input[type="submit"]',
-            ]
-            for sel in login_btn_selectors:
+            # 点登录
+            clicked = False
+            for sel in [
+                'button:contains("Sign in")', 'button:contains("Login")',
+                'button:contains("Log in")', 'button:contains("登录")',
+                'button[type="submit"]', 'input[type="submit"]'
+            ]:
                 try:
                     if sb.is_element_present(sel):
                         sb.uc_click(sel, timeout=5)
-                        login_clicked = True
-                        print(f"✅ 点击登录按钮: {sel}")
+                        clicked = True
                         break
                 except:
                     continue
-
-            if not login_clicked:
-                # 最终手段：JS 点击第一个 submit 按钮
+            if not clicked:
                 try:
-                    sb.driver.execute_script("""
-                        var btn = document.querySelector('button[type="submit"], input[type="submit"], button:contains("Sign in"), button:contains("Login")');
-                        if (btn) btn.click();
-                    """)
-                    login_clicked = True
-                    print("✅ 通过 JS 点击了登录按钮")
+                    sb.driver.execute_script(
+                        "var b=document.querySelector('button[type=submit],input[type=submit]');"
+                        "if(b){b.click()}"
+                    )
+                    clicked = True
                 except:
                     pass
 
-            if login_clicked:
+            if clicked:
                 time.sleep(10)
-                current_url = sb.get_current_url()
-                print(f"📍 登录后 URL: {current_url}")
-                _dump_page(sb, "登录后")
+                print(f"📍 登录后 URL: {sb.get_current_url()}")
+                _dump_page_source(sb, "登录后")
                 return True
-            else:
-                print("⚠️ 未能点击登录按钮")
-                return False
-
+            return False
         except Exception as e:
-            print(f"⚠️ 控制面板登录失败: {e}")
+            print(f"⚠️ 登录异常: {e}")
             return False
 
-    try:
-        # ====== 第一步：导航到目标URL ======
-        print(f"🌐 导航到服务器面板: {url}")
-        sb.open(url)
+    def _nav_to(sb, target_url, desc="页面"):
+        """导航到目标，检测登录并自动处理，返回当前 URL"""
+        print(f"🌐 导航到{desc}: {target_url}")
+        sb.open(target_url)
         sb.wait_for_ready_state_complete()
         time.sleep(8)
-        _dump_page(sb, "首次加载")
-
-        # ====== 第二步：登录检测与处理 ======
-        login_attempts = 0
-        while _is_login_page(sb) and login_attempts < 3:
-            login_attempts += 1
-            print(f"🔄 第 {login_attempts} 次检测到登录页，尝试登录...")
-            _dump_clickable(sb, f"登录页-{login_attempts}")
-            sb.save_screenshot(f"login_page_{login_attempts}.png")
-            ok = _try_login_panel(sb)
-            if not ok:
-                print("⚠️ 登录失败，刷新重试...")
-                sb.driver.refresh()
-                sb.wait_for_ready_state_complete()
-                time.sleep(6)
-            else:
-                # 登录成功后，重新导航到目标URL
-                print("🔄 登录完成，重新导航到服务器面板...")
-                sb.open(url)
-                sb.wait_for_ready_state_complete()
-                time.sleep(8)
-                _dump_page(sb, "登录后重新导航")
-
-        # ====== 第三步：确定当前页面状态 ======
-        current_url = sb.get_current_url()
-        print(f"📍 当前URL: {current_url}")
-
-        if "/server/" not in current_url and "/node/" not in current_url:
-            print("🔀 不在服务器详情页，检查页面内容...")
-            _dump_clickable(sb, "非详情页")
-            # 看看是不是服务器列表页，尝试点击链接
-            try:
-                # 查找所有链接，看有没有包含服务器ID的
-                links = sb.driver.execute_script("""
-                    return Array.from(document.querySelectorAll('a[href*="server"]')).map(function(a) {
-                        return {text: (a.innerText||'').trim().substring(0,40), href: a.getAttribute('href')};
-                    });
-                """)
-                if links and len(links) > 0:
-                    print(f"📋 找到 {len(links)} 个包含 'server' 的链接:")
-                    for l in links:
-                        print(f"   🔗 {l['text']} -> {l['href']}")
-            except:
-                pass
-
-            # 强制导航回目标URL
-            print("🔀 强制导航到目标服务器页面...")
-            sb.open(url)
-            sb.wait_for_ready_state_complete()
-            time.sleep(10)
-            current_url = sb.get_current_url()
-            print(f"📍 强制导航后URL: {current_url}")
-            _dump_page(sb, "强制导航后")
-
-        try:
-            sb.save_screenshot("before_click.png")
-        except Exception:
-            pass
-
-        # ====== 第四步：多轮重试查找按钮 ======
-        btn_clicked = False
-        action_name = ""
-
-        for retry in range(3):
-            print(f"🔍 第 {retry + 1} 轮查找按钮...")
-            _dump_clickable(sb, f"查找-第{retry+1}轮")
-
-            # --- 先找启动按钮（服务器离线状态）---
-            if not btn_clicked:
-                start_selectors = [
-                    # 中文
-                    'button:contains("启动")',
-                    'button:contains("开机")',
-                    'button:contains("开启")',
-                    # 英文
-                    'button:contains("Start")',
-                    'button:contains("Power On")',
-                    'button:contains("PowerOn")',
-                    'button:contains("Turn On")',
-                    'button:contains("Resume")',
-                    # data 属性
-                    'button[data-action="start"]',
-                    'button[value="start"]',
-                    'button[name="start"]',
-                    # 图标
-                    'button i.fa-play',
-                    'button i.fa-power-off',
-                    'button svg[data-icon="play"]',
-                    'button svg[data-icon="power-off"]',
-                    # aria
-                    'button[aria-label*="start" i]',
-                    'button[aria-label*="power" i]',
-                    'button[aria-label*="启动" i]',
-                    'button[aria-label*="开机" i]',
-                    # 链接/span 包裹的按钮
-                    'a:contains("启动"), a:contains("Start"), a:contains("Power On")',
-                    'span:contains("启动") button, span:contains("Start") button',
-                ]
-                ok, used_sel = _try_click_button(sb, start_selectors, "启动")
-                if ok:
-                    btn_clicked = True
-                    action_name = "启动"
-
-            # --- 再找重启按钮（服务器运行状态）---
-            if not btn_clicked:
-                reboot_selectors = [
-                    # 中文
-                    'button:contains("重启")',
-                    'button:contains("重啟")',
-                    'button:contains("重新启动")',
-                    'button:contains("重开")',
-                    'button:contains("重载")',
-                    # 英文
-                    'button:contains("Restart")',
-                    'button:contains("Reboot")',
-                    'button:contains("Reload")',
-                    'button:contains("Reconnect")',
-                    # data 属性
-                    'button[data-action="restart"]',
-                    'button[data-action="reboot"]',
-                    'button[data-action="reload"]',
-                    'button[value="restart"]',
-                    'button[name="restart"]',
-                    # 图标
-                    'button i.fa-redo',
-                    'button i.fa-sync',
-                    'button i.fa-sync-alt',
-                    'button i.fa-rotate',
-                    'button i.fa-repeat',
-                    'button svg[data-icon="redo"]',
-                    'button svg[data-icon="sync"]',
-                    'button svg[data-icon="rotate"]',
-                    'button svg[data-icon="repeat"]',
-                    # aria
-                    'button[aria-label*="restart" i]',
-                    'button[aria-label*="reboot" i]',
-                    'button[aria-label*="重启" i]',
-                    'button[aria-label*="重新启动" i]',
-                    'button[aria-label*="重啟" i]',
-                    # 链接/span 包裹的按钮
-                    'a:contains("重启"), a:contains("Restart"), a:contains("Reboot")',
-                    'span:contains("重启") button, span:contains("Restart") button',
-                ]
-                ok, used_sel = _try_click_button(sb, reboot_selectors, "重启")
-                if ok:
-                    btn_clicked = True
-                    action_name = "重启"
-
-            if btn_clicked:
-                break
-
-            if retry < 2:
-                print(f"⏳ 本轮未找到按钮，刷新页面重试（第{retry + 1}次）...")
-                sb.driver.refresh()
-                sb.wait_for_ready_state_complete()
-                time.sleep(6)
-                # 刷新后重新检查登录
-                if _is_login_page(sb):
-                    print("🔒 刷新后检测到登录页，重新登录...")
-                    _try_login_panel(sb)
-                    # 重新导航
-                    sb.open(url)
-                    sb.wait_for_ready_state_complete()
-                    time.sleep(6)
-
-        # ====== 第五步：JS 深度扫描 ======
-        if not btn_clicked:
-            print("⚠️ 常规选择器均未找到按钮，使用 JavaScript 深度扫描...")
-            try:
-                js_result = sb.driver.execute_script(_JS_DEEP_SCAN)
-                if js_result:
-                    btn_clicked = True
-                    action_name = js_result
-                    print(f"✅ 通过 JavaScript 深度扫描成功点击了【{action_name}】按钮")
-                else:
-                    print("⚠️ JavaScript 深度扫描也未找到任何可用按钮")
-            except Exception as ex:
-                print(f"⚠️ JS 深度扫描执行失败: {ex}")
-
-        # ====== 第六步：最终手段：刷新 + JS 重试 ======
-        if not btn_clicked:
-            print("🔄 最终手段：刷新页面并再次尝试...")
-            try:
-                sb.open(url)
+        for _ in range(3):
+            if _is_login_page(sb):
+                _try_login_panel(sb)
+                # 登录后重新导航
+                sb.open(target_url)
                 sb.wait_for_ready_state_complete()
                 time.sleep(10)
-                sb.save_screenshot("final_retry.png")
-                _dump_page(sb, "最终手段")
-                _dump_clickable(sb, "最终手段")
+            else:
+                break
+        _dump_page_source(sb, desc)
+        return sb.get_current_url()
 
-                js_result = sb.driver.execute_script(_JS_DEEP_SCAN)
-                if js_result:
-                    btn_clicked = True
-                    action_name = js_result + "(最终重试)"
-                    print(f"✅ 最终手段点击成功: {action_name}")
-                else:
-                    print("❌ 最终手段仍未找到任何按钮")
-            except Exception as ex:
-                print(f"⚠️ 最终手段异常: {ex}")
+    def _find_server_from_dashboard(sb):
+        """从面板首页提取服务器链接，返回第一个可用的服务器详情页 URL"""
+        print("🔍 从面板首页查找服务器链接...")
+        html = sb.get_page_source() or ''
+        # 提取所有包含 server 的 href
+        all_urls = re.findall(r'href="([^"]*server[^"]*)"', html, re.IGNORECASE)
+        all_urls = list(set(all_urls))
+        print(f"📋 找到 {len(all_urls)} 个服务器链接:")
+        for u in all_urls:
+            print(f"   🔗 {u}")
 
-        if btn_clicked:
-            print(f"⏳ 等待 {action_name} 命令发送...")
-            time.sleep(3)
-            try:
-                sb.save_screenshot("after_action.png")
-            except Exception:
-                pass
-            return True, f"已成功发送 [{action_name}] 指令"
+        # 优先匹配 SERVER_URL 中的 server_id
+        m = re.search(r'/server/([^/]+)', server_url)
+        target_id = m.group(1) if m else None
+        if target_id:
+            for u in all_urls:
+                if target_id in u:
+                    full = u if u.startswith('http') else urljoin(sb.get_current_url(), u)
+                    print(f"✅ 匹配到服务器 ID {target_id}: {full}")
+                    return full
+
+        if all_urls:
+            first = all_urls[0]
+            full = first if first.startswith('http') else urljoin(sb.get_current_url(), first)
+            print(f"➡️ 使用第一个服务器链接: {full}")
+            return full
+        return None
+
+    def _find_and_click_button(sb):
+        """在服务器详情页找启动/重启按钮"""
+        for retry in range(3):
+            print(f"🔍 第 {retry+1} 轮查找按钮...")
+            _dump_page_source(sb, f"查找-第{retry+1}轮")
+
+            if _is_404(sb):
+                return False, "404"
+
+            # 启动按钮
+            start_sels = [
+                'button:contains("启动")', 'button:contains("开机")', 'button:contains("开启")',
+                'button:contains("Start")', 'button:contains("Power On")', 'button:contains("PowerOn")',
+                'button:contains("Turn On")', 'button:contains("Resume")',
+                'button[data-action="start"]', 'button[value="start"]', 'button[name="start"]',
+                'button i.fa-play', 'button i.fa-power-off',
+                'button svg[data-icon="play"]', 'button svg[data-icon="power-off"]',
+                'button[aria-label*="start" i]', 'button[aria-label*="power" i]',
+                'button[aria-label*="启动" i]', 'button[aria-label*="开机" i]',
+                'a:contains("启动"), a:contains("Start"), a:contains("Power On")',
+            ]
+            ok, _ = _try_click_button(sb, start_sels, "启动")
+            if ok:
+                return True, "启动"
+
+            # 重启按钮
+            reboot_sels = [
+                'button:contains("重启")', 'button:contains("重啟")', 'button:contains("重新启动")',
+                'button:contains("重开")', 'button:contains("重载")',
+                'button:contains("Restart")', 'button:contains("Reboot")', 'button:contains("Reload")',
+                'button:contains("Reconnect")',
+                'button[data-action="restart"]', 'button[data-action="reboot"]', 'button[data-action="reload"]',
+                'button[value="restart"]', 'button[name="restart"]',
+                'button i.fa-redo', 'button i.fa-sync', 'button i.fa-sync-alt',
+                'button i.fa-rotate', 'button i.fa-repeat',
+                'button svg[data-icon="redo"]', 'button svg[data-icon="sync"]',
+                'button svg[data-icon="rotate"]', 'button svg[data-icon="repeat"]',
+                'button[aria-label*="restart" i]', 'button[aria-label*="reboot" i]',
+                'button[aria-label*="重启" i]', 'button[aria-label*="重新启动" i]', 'button[aria-label*="重啟" i]',
+                'a:contains("重启"), a:contains("Restart"), a:contains("Reboot")',
+            ]
+            ok, _ = _try_click_button(sb, reboot_sels, "重启")
+            if ok:
+                return True, "重启"
+
+            if retry < 2:
+                print(f"⏳ 刷新重试...")
+                sb.driver.refresh()
+                sb.wait_for_ready_state_complete()
+                time.sleep(8)
+
+        # JS 深度扫描
+        try:
+            r = sb.driver.execute_script(_JS_DEEP_SCAN)
+            if r:
+                return True, str(r)
+        except:
+            pass
+
+        return False, None
+
+    # ====== 主流程 ======
+    try:
+        sb.save_screenshot("before_server_action.png")
+    except:
+        pass
+
+    # 先尝试直达 server_url
+    _nav_to(sb, server_url, "服务器详情页")
+
+    if _is_404(sb):
+        print("⚠️ 服务器 URL 返回 404，改从面板首页导航...")
+        # 去面板首页
+        _nav_to(sb, "https://panel.therose.cloud/", "面板首页")
+        found = _find_server_from_dashboard(sb)
+        if found:
+            _nav_to(sb, found, "服务器详情页(从首页)")
         else:
-            try:
-                sb.save_screenshot("button_not_found.png")
-                print("📸 已保存页面截图到 button_not_found.png，请查看页面实际状态")
-            except Exception:
-                pass
-            # 即使没找到按钮，也尝试发通知说明情况
-            return False, "页面上未检测到可用的启动或重启按钮（已调试信息截图保存，请查看日志了解页面实际内容）"
+            print("❌ 面板首页未找到服务器链接")
+            sb.save_screenshot("no_server_links.png")
+            return False, "面板首页未找到服务器链接"
 
-    except Exception as e:
-        return False, f"维护操作发生异常: {e}"
+    # 找按钮
+    ok, action = _find_and_click_button(sb)
+
+    if ok:
+        print(f"⏳ 等待 {action} 完成...")
+        time.sleep(3)
+        try:
+            sb.save_screenshot("after_action.png")
+        except:
+            pass
+        return True, f"已发送 [{action}] 指令"
+    else:
+        try:
+            sb.save_screenshot("button_not_found.png")
+        except:
+            pass
+        if action == "404":
+            return False, "服务器页面返回 404，资源不存在"
+        return False, "未找到启动/重启按钮（已截图保存）"
 
 # 主流程
 def main():
