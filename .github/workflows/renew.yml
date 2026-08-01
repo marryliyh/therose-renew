@@ -1,7 +1,9 @@
-name: The Rose Cloud Renew
+name: Auto Renew therose
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/55 * * * *'
 
 # 限制并发运行：如果当前有正在运行的相同工作流，则取消旧的运行新任务
 concurrency:
@@ -19,17 +21,17 @@ jobs:
 
     steps:
       - name: 📥 Checkout repository
-        uses: actions/checkout@v4 # 修正为当前最新的 v4 版本
+        uses: actions/checkout@v4
 
       - name: ⚙️ 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # 删掉了 cache: 'pip' 这一行
+          # 对于这种轻量依赖，不开启 cache 也能极速安装，减少复杂性
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
-          sudo apt-get update
+          sudo apt-get update -q
           sudo apt-get install -y xvfb
           pip install seleniumbase requests
           seleniumbase install chromedriver
@@ -40,15 +42,16 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🚀 运行续期与重启脚本
+      - name: 🚀 运行续期与状态维护脚本
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          SERVER_URL: ${{ secrets.SERVER_URL }} # [新增] 传递服务器面板链接
+          SERVER_URL: ${{ secrets.SERVER_URL }}
           IS_PROXY: ${{ env.IS_PROXY }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
+          TZ: Asia/Shanghai # 设置时区，方便看日志排错
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 therose.py
 
       - name: 📤 上传运行截图 (用于排错)
@@ -56,8 +59,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: run-screenshots
-          path: ./*.png # 捕获根目录下所有的截图
-          retention-days: 3 # 截图保留3天即可
+          path: ./*.png
+          retention-days: 3
+          if-no-files-found: ignore # 如果没有找到截图，忽略警告，不显示 Workflow 报错提示
 
       - name: 🧽 清理进程和临时文件
         if: always()
@@ -73,12 +77,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 获取运行记录 ID，并保留最近 5 次记录（将原本的 1 改为了 5，方便回溯排错）
           runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
+            if [ $count -gt 5 ]; then
+              echo "🗑️ 删除较旧的运行记录: $run_id"
               gh run delete $run_id || true
             fi
           done
