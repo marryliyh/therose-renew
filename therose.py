@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, requests
+import os, re, sys, time, json, requests
 from seleniumbase import SB
 
 # 环境变量
@@ -297,6 +297,62 @@ for (let btn of allBtns) {
 return null;
 """
 
+# ====== JS 转储页面所有可交互元素（用于调试）======
+_JS_DUMP_ELEMENTS = """
+(function() {
+    var results = [];
+    var els = document.querySelectorAll('button, a, input[type="submit"], input[type="button"], [role="button"], .btn, [onclick], [data-action]');
+    for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) continue;
+        results.push({
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute('type') || '',
+            text: (el.innerText || el.textContent || '').trim().substring(0, 60),
+            title: (el.getAttribute('title') || '').substring(0, 40),
+            'aria-label': (el.getAttribute('aria-label') || '').substring(0, 40),
+            'data-action': el.getAttribute('data-action') || '',
+            name: el.getAttribute('name') || '',
+            value: el.getAttribute('value') || '',
+            'class': (el.className || '').substring(0, 40),
+            href: (el.getAttribute('href') || '').substring(0, 60),
+            visible: el.offsetParent !== null,
+            disabled: el.disabled,
+            rect: rect.width.toFixed(0) + 'x' + rect.height.toFixed(0)
+        });
+    }
+    return JSON.stringify(results, null, 2);
+})();
+"""
+
+# ====== JS 获取页面关键调试信息 ======
+_JS_PAGE_INFO = """
+(function() {
+    var info = {
+        title: document.title,
+        url: location.href,
+        bodyTextPreview: (document.body ? document.body.innerText || '' : '').trim().substring(0, 2000),
+        loginForm: null,
+        passwordInputs: document.querySelectorAll('input[type="password"]').length,
+        textInputs: document.querySelectorAll('input[type="text"], input[type="email"], input[name="user"], input[name="email"]').length,
+        buttons: document.querySelectorAll('button').length,
+        links: document.querySelectorAll('a').length,
+    };
+    var pw = document.querySelector('input[type="password"]');
+    if (pw) {
+        var form = pw.closest('form');
+        info.loginForm = form ? (form.id || form.className || 'unknown_form') : 'no_form';
+        var labels = document.querySelectorAll('label');
+        info.labels = [];
+        for (var i = 0; i < labels.length; i++) {
+            info.labels.push((labels[i].innerText || '').trim().substring(0, 30));
+        }
+    }
+    return JSON.stringify(info, null, 2);
+})();
+"""
+
 # 执行启动或重启服务器操作
 def start_or_reboot_server(sb, url):
     print(f"🔄 准备进入服务器面板进行启动/重启: {url}")
@@ -306,64 +362,244 @@ def start_or_reboot_server(sb, url):
     except Exception:
         pass
 
+    def _dump_page(sb, tag):
+        """打印当前页面关键信息，用于调试"""
+        try:
+            page_info = sb.driver.execute_script(_JS_PAGE_INFO)
+            info = json.loads(page_info)
+            print(f"📋 [{tag}] 页面标题: {info['title']}")
+            print(f"📋 [{tag}] 当前URL: {info['url']}")
+            print(f"📋 [{tag}] 密码框: {info['passwordInputs']}个, 输入框: {info['textInputs']}个, 按钮: {info['buttons']}个, 链接: {info['links']}个")
+            if info.get('loginForm'):
+                print(f"📋 [{tag}] 检测到登录表单: {info['loginForm']}")
+                if info.get('labels'):
+                    print(f"📋 [{tag}] 表单标签: {info['labels']}")
+            if info.get('bodyTextPreview'):
+                preview = info['bodyTextPreview'][:500]
+                print(f"📋 [{tag}] 页面文字预览(前500字符):\n{preview}")
+        except Exception as e:
+            print(f"⚠️ [{tag}] 获取页面信息失败: {e}")
+
+    def _dump_clickable(sb, tag):
+        """转储页面上所有可点击元素，用于调试"""
+        try:
+            dump = sb.driver.execute_script(_JS_DUMP_ELEMENTS)
+            elements = json.loads(dump)
+            print(f"📋 [{tag}] 页面上可见的可交互元素列表 ({len(elements)}个):")
+            for idx, el in enumerate(elements):
+                print(f"   [{idx}] <{el['tag']}> text='{el['text']}' title='{el['title']}' "
+                      f"aria='{el['aria-label']}' action='{el['data-action']}' "
+                      f"name='{el['name']}' value='{el['value']}' "
+                      f"class='{el['class']}' href='{el['href']}' "
+                      f"visible={el['visible']} disabled={el['disabled']} size={el['rect']}")
+        except Exception as e:
+            print(f"⚠️ [{tag}] 转储可点击元素失败: {e}")
+
+    def _is_login_page(sb):
+        """判断当前页面是否是登录页"""
+        try:
+            # 1. URL 包含 login / signin
+            url = sb.get_current_url().lower()
+            if 'login' in url or 'signin' in url or 'auth' in url or 'log-in' in url:
+                return True
+            # 2. 页面有密码框
+            pw_count = len(sb.driver.execute_script("return document.querySelectorAll('input[type=\"password\"]').length"))
+            if pw_count > 0:
+                return True
+            # 3. 页面文字包含 "Sign in" / "Login" 且有表单
+            text = (sb.driver.execute_script("return document.body ? document.body.innerText : ''") or '').lower()
+            if ('sign in' in text or 'login' in text or 'log in' in text) and pw_count > 0:
+                return True
+        except:
+            pass
+        return False
+
+    def _try_login_panel(sb):
+        """在控制面板的登录页尝试登录"""
+        print("🔒 检测到控制面板登录页，正在尝试自动登录...")
+        _dump_page(sb, "登录页")
+        try:
+            # 找所有输入框
+            pw_inputs = sb.driver.execute_script("return document.querySelectorAll('input[type=\"password\"]').length")
+            if pw_inputs == 0:
+                print("⚠️ 未找到密码输入框，跳过自动登录")
+                return False
+
+            # 找邮箱/用户名输入框
+            email_selectors = [
+                'input[type="text"]', 'input[type="email"]', 'input[name="user"]',
+                'input[name="email"]', 'input[name="username"]', 'input[name="login"]'
+            ]
+            email_filled = False
+            for sel in email_selectors:
+                try:
+                    inputs = sb.driver.find_elements("css selector", sel)
+                    for inp in inputs:
+                        if inp.is_displayed():
+                            inp.clear()
+                            inp.send_keys(EMAIL)
+                            email_filled = True
+                            print(f"✅ 已填写邮箱到: {sel}")
+                            break
+                    if email_filled:
+                        break
+                except:
+                    continue
+
+            if not email_filled:
+                print("⚠️ 未找到邮箱输入框，尝试使用第一个可见文本输入框")
+                try:
+                    all_inputs = sb.driver.execute_script("""
+                        return Array.from(document.querySelectorAll('input')).filter(function(el) {
+                            return el.type !== 'hidden' && el.type !== 'password' && el.offsetParent !== null;
+                        });
+                    """)
+                    if all_inputs and len(all_inputs) > 0:
+                        all_inputs[0].clear()
+                        all_inputs[0].send_keys(EMAIL)
+                        print("✅ 已填写邮箱到第一个可见输入框")
+                except:
+                    pass
+
+            # 填写密码
+            try:
+                pw_input = sb.driver.find_element("css selector", 'input[type="password"]')
+                pw_input.clear()
+                pw_input.send_keys(PASSWORD)
+                print("✅ 已填写密码")
+            except Exception as e:
+                print(f"⚠️ 填写密码失败: {e}")
+
+            time.sleep(1)
+
+            # 尝试 Turnstile
+            try:
+                sb.uc_gui_click_captcha()
+                print("✅ Turnstile 验证已处理")
+            except Exception as e:
+                print(f"⚠️ Turnstile 处理: {e}")
+
+            time.sleep(3)
+
+            # 点击登录按钮 - 各种尝试
+            login_clicked = False
+            login_btn_selectors = [
+                'button:contains("Sign in")',
+                'button:contains("Login")',
+                'button:contains("Log in")',
+                'button:contains("Sign In")',
+                'button:contains("登录")',
+                'button[type="submit"]',
+                'input[type="submit"]',
+            ]
+            for sel in login_btn_selectors:
+                try:
+                    if sb.is_element_present(sel):
+                        sb.uc_click(sel, timeout=5)
+                        login_clicked = True
+                        print(f"✅ 点击登录按钮: {sel}")
+                        break
+                except:
+                    continue
+
+            if not login_clicked:
+                # 最终手段：JS 点击第一个 submit 按钮
+                try:
+                    sb.driver.execute_script("""
+                        var btn = document.querySelector('button[type="submit"], input[type="submit"], button:contains("Sign in"), button:contains("Login")');
+                        if (btn) btn.click();
+                    """)
+                    login_clicked = True
+                    print("✅ 通过 JS 点击了登录按钮")
+                except:
+                    pass
+
+            if login_clicked:
+                time.sleep(10)
+                current_url = sb.get_current_url()
+                print(f"📍 登录后 URL: {current_url}")
+                _dump_page(sb, "登录后")
+                return True
+            else:
+                print("⚠️ 未能点击登录按钮")
+                return False
+
+        except Exception as e:
+            print(f"⚠️ 控制面板登录失败: {e}")
+            return False
+
     try:
+        # ====== 第一步：导航到目标URL ======
+        print(f"🌐 导航到服务器面板: {url}")
         sb.open(url)
         sb.wait_for_ready_state_complete()
-        print("⏳ 等待页面渲染完成...")
-        time.sleep(8)  # 给足时间加载
+        time.sleep(8)
+        _dump_page(sb, "首次加载")
 
-        # ---------- 1. 独立登录检测 ----------
-        try:
-            pw_inputs = sb.find_elements('input[type="password"]', timeout=3)
-            if pw_inputs and len(pw_inputs) > 0:
-                print("🔒 检测到控制面板需要独立登录，正在尝试自动输入账号密码...")
-                try:
-                    email_inputs = sb.find_elements('input[name="user"], input[type="text"], input[name="email"]', timeout=3)
-                    if email_inputs and len(email_inputs) > 0:
-                        sb.type('input[name="user"], input[type="text"], input[name="email"]', EMAIL, timeout=5)
-                    sb.type('input[type="password"]', PASSWORD, timeout=5)
-                    time.sleep(1)
+        # ====== 第二步：登录检测与处理 ======
+        login_attempts = 0
+        while _is_login_page(sb) and login_attempts < 3:
+            login_attempts += 1
+            print(f"🔄 第 {login_attempts} 次检测到登录页，尝试登录...")
+            _dump_clickable(sb, f"登录页-{login_attempts}")
+            sb.save_screenshot(f"login_page_{login_attempts}.png")
+            ok = _try_login_panel(sb)
+            if not ok:
+                print("⚠️ 登录失败，刷新重试...")
+                sb.driver.refresh()
+                sb.wait_for_ready_state_complete()
+                time.sleep(6)
+            else:
+                # 登录成功后，重新导航到目标URL
+                print("🔄 登录完成，重新导航到服务器面板...")
+                sb.open(url)
+                sb.wait_for_ready_state_complete()
+                time.sleep(8)
+                _dump_page(sb, "登录后重新导航")
 
-                    try:
-                        sb.uc_gui_click_captcha()
-                    except Exception:
-                        pass
-
-                    time.sleep(3)
-                    try:
-                        # 优先用 uc_click 绕过检测
-                        sb.uc_click('button:contains("Login"), button:contains("Sign in"), button[type="submit"]', timeout=5)
-                    except Exception:
-                        sb.click('button[type="submit"]')
-                    time.sleep(8)
-                    print("✅ 控制面板独立登录完成")
-                except Exception as e:
-                    print(f"⚠️ 自动登录控制面板发生错误: {e}")
-        except Exception:
-            pass
-
-        # ---------- 2. 检查是否在详情页 ----------
+        # ====== 第三步：确定当前页面状态 ======
         current_url = sb.get_current_url()
-        print(f"📍 当前页面 URL: {current_url}")
+        print(f"📍 当前URL: {current_url}")
+
         if "/server/" not in current_url and "/node/" not in current_url:
-            print("🔀 检测到不在服务器详情页，正在强制进入目标服务器控制台...")
+            print("🔀 不在服务器详情页，检查页面内容...")
+            _dump_clickable(sb, "非详情页")
+            # 看看是不是服务器列表页，尝试点击链接
+            try:
+                # 查找所有链接，看有没有包含服务器ID的
+                links = sb.driver.execute_script("""
+                    return Array.from(document.querySelectorAll('a[href*="server"]')).map(function(a) {
+                        return {text: (a.innerText||'').trim().substring(0,40), href: a.getAttribute('href')};
+                    });
+                """)
+                if links and len(links) > 0:
+                    print(f"📋 找到 {len(links)} 个包含 'server' 的链接:")
+                    for l in links:
+                        print(f"   🔗 {l['text']} -> {l['href']}")
+            except:
+                pass
+
+            # 强制导航回目标URL
+            print("🔀 强制导航到目标服务器页面...")
             sb.open(url)
             sb.wait_for_ready_state_complete()
-            time.sleep(6)
+            time.sleep(10)
             current_url = sb.get_current_url()
-            print(f"📍 导航后 URL: {current_url}")
+            print(f"📍 强制导航后URL: {current_url}")
+            _dump_page(sb, "强制导航后")
 
         try:
             sb.save_screenshot("before_click.png")
         except Exception:
             pass
 
-        # ---------- 3. 多轮重试查找按钮 ----------
+        # ====== 第四步：多轮重试查找按钮 ======
         btn_clicked = False
         action_name = ""
 
         for retry in range(3):
             print(f"🔍 第 {retry + 1} 轮查找按钮...")
+            _dump_clickable(sb, f"查找-第{retry+1}轮")
 
             # --- 先找启动按钮（服务器离线状态）---
             if not btn_clicked:
@@ -454,22 +690,16 @@ def start_or_reboot_server(sb, url):
                 sb.driver.refresh()
                 sb.wait_for_ready_state_complete()
                 time.sleep(6)
-                # 刷新后重新检查独立登录
-                try:
-                    pw_inputs = sb.find_elements('input[type="password"]', timeout=2)
-                    if pw_inputs and len(pw_inputs) > 0:
-                        print("🔒 刷新后检测到登录框，重新登录...")
-                        sb.type('input[type="password"]', PASSWORD, timeout=3)
-                        time.sleep(1)
-                        try:
-                            sb.uc_click('button:contains("Login"), button:contains("Sign in"), button[type="submit"]', timeout=5)
-                        except Exception:
-                            pass
-                        time.sleep(8)
-                except Exception:
-                    pass
+                # 刷新后重新检查登录
+                if _is_login_page(sb):
+                    print("🔒 刷新后检测到登录页，重新登录...")
+                    _try_login_panel(sb)
+                    # 重新导航
+                    sb.open(url)
+                    sb.wait_for_ready_state_complete()
+                    time.sleep(6)
 
-        # ---------- 4. JS 深度扫描 ----------
+        # ====== 第五步：JS 深度扫描 ======
         if not btn_clicked:
             print("⚠️ 常规选择器均未找到按钮，使用 JavaScript 深度扫描...")
             try:
@@ -483,7 +713,7 @@ def start_or_reboot_server(sb, url):
             except Exception as ex:
                 print(f"⚠️ JS 深度扫描执行失败: {ex}")
 
-        # ---------- 5. 最终手段：刷新 + JS 重试 ----------
+        # ====== 第六步：最终手段：刷新 + JS 重试 ======
         if not btn_clicked:
             print("🔄 最终手段：刷新页面并再次尝试...")
             try:
@@ -491,6 +721,8 @@ def start_or_reboot_server(sb, url):
                 sb.wait_for_ready_state_complete()
                 time.sleep(10)
                 sb.save_screenshot("final_retry.png")
+                _dump_page(sb, "最终手段")
+                _dump_clickable(sb, "最终手段")
 
                 js_result = sb.driver.execute_script(_JS_DEEP_SCAN)
                 if js_result:
@@ -516,7 +748,8 @@ def start_or_reboot_server(sb, url):
                 print("📸 已保存页面截图到 button_not_found.png，请查看页面实际状态")
             except Exception:
                 pass
-            return False, "页面上未检测到可用的启动或重启按钮（已截图保存）"
+            # 即使没找到按钮，也尝试发通知说明情况
+            return False, "页面上未检测到可用的启动或重启按钮（已调试信息截图保存，请查看日志了解页面实际内容）"
 
     except Exception as e:
         return False, f"维护操作发生异常: {e}"
